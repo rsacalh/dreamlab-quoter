@@ -9,7 +9,7 @@ from pathlib import Path
 from difflib import get_close_matches
 
 from dotenv import load_dotenv
-from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 # Email
@@ -927,7 +927,7 @@ DEFAULT_EXTRA_RATES = {
 def get_mongo_client():
     if not MONGODB_URI:
         raise RuntimeError("Falta configurar MONGODB_URI en secrets o variables de entorno.")
-    return MongoClient(MONGODB_URI)
+    return MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
 
 
 def get_db():
@@ -936,6 +936,13 @@ def get_db():
 
 def get_collection(name: str):
     return get_db()[name]
+
+
+def clear_app_caches() -> None:
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
 def _now_str() -> str:
@@ -958,16 +965,19 @@ def _doc_to_row(doc: dict) -> dict:
     return row
 
 
-def _collection_to_df(collection_name: str, sort_field: Optional[str] = None, ascending: bool = True) -> pd.DataFrame:
+def _collection_to_df(collection_name: str, sort_field: Optional[str] = None, ascending: bool = True, limit: Optional[int] = None, projection: Optional[dict] = None) -> pd.DataFrame:
     collection = get_collection(collection_name)
-    sort = []
+    cursor = collection.find({}, projection or {"_id": 0})
     if sort_field:
-        sort = [(sort_field, ASCENDING if ascending else -1)]
-    docs = list(collection.find({}, {"_id": 0}).sort(sort)) if sort else list(collection.find({}, {"_id": 0}))
+        cursor = cursor.sort(sort_field, ASCENDING if ascending else DESCENDING)
+    if limit:
+        cursor = cursor.limit(limit)
+    docs = list(cursor)
     return pd.DataFrame(docs)
 
 
-def init_db():
+@st.cache_resource
+def init_db_once():
     db = get_db()
 
     db["influencers"].create_index([("id", ASCENDING)], unique=True)
@@ -977,63 +987,73 @@ def init_db():
     db["clients"].create_index([("id", ASCENDING)], unique=True)
     db["clients"].create_index([("username", ASCENDING)], unique=True)
     db["quotes"].create_index([("id", ASCENDING)], unique=True)
+    db["quotes"].create_index([("owner_username", ASCENDING), ("timestamp", DESCENDING)])
     db["sent_proposals"].create_index([("id", ASCENDING)], unique=True)
+    db["sent_proposals"].create_index([("owner_username", ASCENDING), ("sent_at", DESCENDING)])
 
     now = _now_str()
 
-    for brand_name in DEFAULT_BRANDS:
-        clean_name = clean_brand_display_name(brand_name)
-        norm_name = normalize_brand_name(brand_name)
-        if clean_name and norm_name:
-            db["brands"].update_one(
-                {"normalized_name": norm_name},
-                {"$setOnInsert": {
-                    "id": _next_id("brands") if not db["brands"].find_one({"normalized_name": norm_name}) else None,
+    if db["brands"].estimated_document_count() == 0:
+        brand_docs = []
+        next_brand_id = 1
+        for brand_name in DEFAULT_BRANDS:
+            clean_name = clean_brand_display_name(brand_name)
+            norm_name = normalize_brand_name(brand_name)
+            if clean_name and norm_name:
+                brand_docs.append({
+                    "id": next_brand_id,
                     "display_name": clean_name,
                     "normalized_name": norm_name,
                     "created_at": now,
                     "created_by": "system",
-                }},
-                upsert=True,
-            )
-            db["brands"].update_one({"normalized_name": norm_name, "id": None}, {"$set": {"id": _next_id("brands")}})
+                })
+                next_brand_id += 1
+        if brand_docs:
+            db["brands"].insert_many(brand_docs, ordered=False)
+            db["counters"].update_one({"_id": "brands"}, {"$max": {"seq": len(brand_docs)}}, upsert=True)
 
-    now_clients = _now_str()
-    for username, data in CLIENT_SEED_USERS.items():
-        uname = _normalize_username(username)
-        existing = db["clients"].find_one({"username": uname})
-        if not existing:
-            db["clients"].insert_one({
-                "id": _next_id("clients"),
+    if db["clients"].estimated_document_count() == 0 and CLIENT_SEED_USERS:
+        client_docs = []
+        next_client_id = 1
+        now_clients = _now_str()
+        for username, data in CLIENT_SEED_USERS.items():
+            uname = _normalize_username(username)
+            if not uname:
+                continue
+            client_docs.append({
+                "id": next_client_id,
                 "username": uname,
                 "password": str(data.get("password", "")).strip(),
                 "display_name": str(data.get("display_name", username)).strip(),
                 "created_at": now_clients,
                 "updated_at": now_clients,
             })
+            next_client_id += 1
+        if client_docs:
+            db["clients"].insert_many(client_docs, ordered=False)
+            db["counters"].update_one({"_id": "clients"}, {"$max": {"seq": len(client_docs)}}, upsert=True)
 
-    for nombre, rates in DEFAULT_RATES.items():
-        existing = db["influencers"].find_one({"nombre": nombre})
-        if not existing:
+    if db["influencers"].estimated_document_count() == 0 and DEFAULT_RATES:
+        influencer_docs = []
+        next_influencer_id = 1
+        for nombre, rates in DEFAULT_RATES.items():
             doc = {
-                "id": _next_id("influencers"),
+                "id": next_influencer_id,
                 "nombre": nombre,
                 "updated_at": now,
             }
             doc.update(rates)
             doc.update(DEFAULT_EXTRA_RATES)
-            db["influencers"].insert_one(doc)
-        else:
-            set_on_missing = {}
-            for col, val in {**rates, **DEFAULT_EXTRA_RATES}.items():
-                if existing.get(col) is None:
-                    set_on_missing[col] = val
-            if existing.get("updated_at") is None:
-                set_on_missing["updated_at"] = now
-            if set_on_missing:
-                db["influencers"].update_one({"id": existing["id"]}, {"$set": set_on_missing})
+            influencer_docs.append(doc)
+            next_influencer_id += 1
+        if influencer_docs:
+            db["influencers"].insert_many(influencer_docs, ordered=False)
+            db["counters"].update_one({"_id": "influencers"}, {"$max": {"seq": len(influencer_docs)}}, upsert=True)
+
+    return True
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def load_influencers_df() -> pd.DataFrame:
     cols = ["id", "nombre"] + REQUIRED_RATE_COLUMNS + EXTRA_RATE_COLUMNS + ["updated_at"]
     df = _collection_to_df("influencers", "nombre", True)
@@ -1045,6 +1065,14 @@ def load_influencers_df() -> pd.DataFrame:
     return df[cols]
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_influencer_lookup() -> Dict[str, dict]:
+    df = load_influencers_df()
+    if df.empty:
+        return {}
+    return {str(row["nombre"]): row.to_dict() for _, row in df.iterrows()}
+
+
 def add_influencer(nombre: str, rates: dict, extra_rates: dict) -> None:
     try:
         get_collection("influencers").insert_one({
@@ -1054,6 +1082,7 @@ def add_influencer(nombre: str, rates: dict, extra_rates: dict) -> None:
             **{col: extra_rates[col] for col in EXTRA_RATE_COLUMNS},
             "updated_at": _now_str(),
         })
+        clear_app_caches()
     except DuplicateKeyError as e:
         raise ValueError("Ese influencer ya existe.") from e
 
@@ -1071,12 +1100,15 @@ def update_influencer(influencer_id: int, nombre: str, rates: dict, extra_rates:
             "updated_at": _now_str(),
         }}
     )
+    clear_app_caches()
 
 
 def delete_influencer(influencer_id: int) -> None:
     get_collection("influencers").delete_one({"id": influencer_id})
+    clear_app_caches()
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def load_clients_df() -> pd.DataFrame:
     df = _collection_to_df("clients", "display_name", True)
     cols = ["id", "username", "password", "display_name", "created_at", "updated_at"]
@@ -1088,19 +1120,29 @@ def load_clients_df() -> pd.DataFrame:
     return df[cols].sort_values(["display_name", "username"], key=lambda s: s.astype(str).str.lower())
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_client_auth_map() -> Dict[str, Dict[str, str]]:
+    rows = list(get_collection("clients").find({}, {"_id": 0, "username": 1, "password": 1, "display_name": 1}))
+    result: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        uname = _normalize_username(row.get("username", ""))
+        if not uname:
+            continue
+        result[uname] = {
+            "username": uname,
+            "password": str(row.get("password", "")),
+            "role": "client",
+            "display_name": str(row.get("display_name", uname)),
+        }
+    return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def get_client_user_by_username(username: str) -> Optional[Dict[str, str]]:
     uname = _normalize_username(username)
     if not uname:
         return None
-    row = get_collection("clients").find_one({"username": uname}, {"_id": 0})
-    if not row:
-        return None
-    return {
-        "username": row["username"],
-        "password": row["password"],
-        "role": "client",
-        "display_name": row["display_name"],
-    }
+    return load_client_auth_map().get(uname)
 
 
 def add_client_account(username: str, password: str, display_name: str) -> Dict[str, Any]:
@@ -1127,6 +1169,7 @@ def add_client_account(username: str, password: str, display_name: str) -> Dict[
         "created_at": now,
         "updated_at": now,
     })
+    clear_app_caches()
     return {"ok": True}
 
 
@@ -1154,13 +1197,16 @@ def update_client_account(client_id: int, username: str, password: str, display_
             "updated_at": _now_str(),
         }}
     )
+    clear_app_caches()
     return {"ok": True}
 
 
 def delete_client_account(client_id: int) -> None:
     get_collection("clients").delete_one({"id": client_id})
+    clear_app_caches()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_brands_df() -> pd.DataFrame:
     df = _collection_to_df("brands", "display_name", True)
     cols = ["id", "display_name", "normalized_name", "created_at", "created_by"]
@@ -1172,6 +1218,7 @@ def load_brands_df() -> pd.DataFrame:
     return df[cols]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_brand_options() -> List[str]:
     df = load_brands_df()
     if df.empty:
@@ -1179,6 +1226,7 @@ def load_brand_options() -> List[str]:
     return df["display_name"].dropna().astype(str).tolist()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def find_existing_brand_name(name: str) -> Optional[str]:
     normalized = normalize_brand_name(name)
     if not normalized:
@@ -1206,6 +1254,7 @@ def add_brand(display_name: str, created_by: str) -> Dict[str, Any]:
             "created_at": _now_str(),
             "created_by": created_by,
         })
+        clear_app_caches()
         return {"ok": True, "brand": cleaned}
     except DuplicateKeyError:
         existing = find_existing_brand_name(cleaned)
@@ -1257,6 +1306,7 @@ def save_quote_to_db(payload: dict) -> int:
         "created_by_role": payload.get("created_by_role"),
     }
     get_collection("quotes").insert_one(doc)
+    clear_app_caches()
     return quote_id
 
 
@@ -1265,11 +1315,13 @@ def update_quote_payload_json(quote_id: int, payload: dict) -> None:
         {"id": quote_id},
         {"$set": {"payload_json": json.dumps(payload, ensure_ascii=False)}}
     )
+    clear_app_caches()
 
 
-def load_quotes_df() -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def load_quotes_df(limit: int = 50) -> pd.DataFrame:
     cols = ["id", "timestamp", "marca", "cliente", "campania", "talento", "temporalidad_meses", "total_base", "total_extras", "total_final", "payload_json", "owner_username", "owner_display_name", "created_by_role"]
-    df = _collection_to_df("quotes", "timestamp", False)
+    df = _collection_to_df("quotes", "timestamp", False, limit=limit, projection={"_id": 0})
     if df.empty:
         return pd.DataFrame(columns=cols)
     for col in cols:
@@ -1292,11 +1344,13 @@ def save_sent_proposal(payload: dict, to_email: str, subject: str, quote_id: int
         "owner_display_name": payload.get("owner_display_name"),
         "created_by_role": payload.get("created_by_role"),
     })
+    clear_app_caches()
 
 
-def load_sent_df() -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sent_df(limit: int = 50) -> pd.DataFrame:
     cols = ["id", "sent_at", "to_email", "subject", "quote_id", "success", "error", "payload_json", "owner_username", "owner_display_name", "created_by_role"]
-    df = _collection_to_df("sent_proposals", "sent_at", False)
+    df = _collection_to_df("sent_proposals", "sent_at", False, limit=limit, projection={"_id": 0})
     if df.empty:
         return pd.DataFrame(columns=cols)
     for col in cols:
@@ -1305,7 +1359,7 @@ def load_sent_df() -> pd.DataFrame:
     return df[cols]
 
 
-init_db()
+init_db_once()
 
 
 # ==================== LOGIN GATE ====================
@@ -1370,11 +1424,11 @@ with st.sidebar:
     menu_options = ["Cotizador"] if current_role != "admin" else ["Cotizador", "Gestión de influencers", "Gestión de clientes", "Historial"]
     opcion = st.radio("Secciones", menu_options)
 
-df_inf = load_influencers_df()
-
 
 # ==================== COTIZADOR ====================
 if opcion == "Cotizador":
+    df_inf = load_influencers_df()
+    influencer_lookup = load_influencer_lookup()
     render_cotizador_banner()
     st.markdown(
         '<div class="dreamlab-subtle">Cotiza acciones + extras. Guarda historial y permite enviar propuesta (correo fijo).</div>',
@@ -1390,7 +1444,7 @@ if opcion == "Cotizador":
     meses = st.slider("", min_value=1, max_value=12, value=3, label_visibility="collapsed")
     temporalidad = f"{meses} mes" if meses == 1 else f"{meses} meses"
 
-    row = df_inf[df_inf["nombre"] == influencer_nombre].iloc[0].to_dict()
+    row = influencer_lookup.get(influencer_nombre, {})
 
     img_pct_1_3 = _safe_float(row.get("img_pct_1_3"), 0.25)
     img_pct_4_6 = _safe_float(row.get("img_pct_4_6"), 0.40)
